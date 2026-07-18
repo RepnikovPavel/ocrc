@@ -1,0 +1,59 @@
+# ocrc — order PDF/document parsing from a dots.mocr service (for AI agents / LLMs)
+#
+# This file is a minimal, low-token brief you can include in an agent's context.
+# Full docs: see ./if_necessary_you_can_read_me/  Source: ./dont_read_me_src/
+
+WHAT IT DOES
+  Sends a PDF or image to a dots.mocr service and brings back the parse as a
+  folder: document.md plus images/ that the markdown links to, plus layout JSON.
+  The service deduplicates on file content, so asking twice for the same
+  document is a lookup, not a second parse (measured 0.04 s vs 29 s).
+  Python 3 standard library only — no pip install, no virtualenv.
+
+HOW TO CALL
+  ocrc parse paper.pdf                  # parse everything, wait, unpack to ./ocrc-out
+  ocrc parse a.pdf b.pdf --out /tmp/x   # several documents
+  ocrc parse paper.pdf --pages 0,1,2    # 0-based page selection
+  ocrc parse paper.pdf --no-wait        # queue it and return immediately
+  ocrc queue                            # who is waiting, in order
+  ocrc watch                            # follow the queue as events arrive
+  ocrc search "attention"               # full-text over everything parsed
+  ocrc stats                            # store size, cache reuse, engine state
+
+  Server address: --server URL, or env OCRC_SERVER (default http://127.0.0.1:8601)
+
+OUTPUT  (TSV, tab-separated, deterministic, easy to parse)
+  parse:   file<TAB>sha256<TAB>status<TAB>pages<TAB>tokens<TAB>output
+           status is "parsed" (ran now) or "cached" (served from the store)
+           output is the path to document.md
+  queue:   position<TAB>task<TAB>agent<TAB>sha256<TAB>mode<TAB>pages<TAB>status
+  search:  sha256<TAB>file<TAB>mode<TAB>snippet
+  stats:   key<TAB>value
+
+  stdout is ONLY the TSV. Progress, waiting and errors go to stderr, so
+  `ocrc parse x.pdf | cut -f6` is safe.
+
+PROMPT MODES  (--prompt-mode, default prompt_layout_all_en)
+  prompt_layout_all_en   blocks + categories + text -> markdown  (the usual one)
+  prompt_layout_only_en  detection only, no text    (~3x faster)
+  prompt_ocr             plain text of the page
+  prompt_grounding_ocr   text inside a bbox
+  prompt_web_parsing     screenshot of a web page
+  prompt_scene_spotting  text in photos/signs
+  prompt_general         free-form question about the page
+
+COOPERATING WITH OTHER AGENTS
+  `ocrc queue` shows every waiting task with the agent name that submitted it,
+  so before queueing a long document you can see whether someone already did.
+  `ocrc watch` streams the same thing (Server-Sent Events) without polling.
+  Pass --agent NAME so others can see who you are; defaults to $OCRC_AGENT.
+
+COST NOTES
+  A page is ~10-30 s depending on how much text it contains: the time is in
+  generating the answer, not in reading the image. --pages on a long PDF is the
+  cheapest lever; prompt_layout_only_en is the next one.
+  Parsing is idempotent per (content, prompt mode, page selection) — resubmitting
+  is free, so prefer resubmitting over caching results yourself.
+
+EXIT CODES
+  0 ok · 2 usage error · non-zero with a message on stderr for anything else
