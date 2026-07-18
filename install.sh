@@ -29,8 +29,31 @@ fi
 chmod +x "$TARGET"
 
 echo "installed: $TARGET"
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) echo "note: $BIN_DIR is not on PATH — add it, or call $TARGET directly" ;;
-esac
+
+# Ensure $BIN_DIR is on PATH for interactive AND non-interactive shells. A bare
+# "note:" is easy to miss when piped through `sh`, leaving `ocrc` uncallable
+# from the next ssh / non-login shell (issue ocr#7). We add a single guarded
+# export line to the first existing rc file, marked so re-runs are idempotent.
+ensure_on_path() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+    [ -d "$BIN_DIR" ] || return 0
+    _marker='# ocrc: added by install.sh'
+    _line="export PATH=\"\$PATH:$BIN_DIR\"  $_marker"
+    # Prefer .bashrc (most shells source it); fall back to .profile / .shrc
+    _rc=""
+    for _cand in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.shrc"; do
+        if [ -f "$_cand" ] || [ -w "$HOME" ]; then _rc="$_cand"; break; fi
+    done
+    [ -n "$_rc" ] || return 0
+    if grep -qF "$_marker" "$_rc" 2>/dev/null; then
+        :
+    else
+        printf '\n%s\n' "$_line" >> "$_rc"
+        echo "added '$BIN_DIR' to PATH via $_rc (new shells will pick it up)"
+    fi
+}
+ensure_on_path
+
 "$TARGET" --version

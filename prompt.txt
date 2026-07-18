@@ -23,15 +23,22 @@ HOW TO CALL
   Server address: --server URL, or env OCRC_SERVER (default http://127.0.0.1:8601)
 
 OUTPUT  (TSV, tab-separated, deterministic, easy to parse)
-  parse:   file<TAB>sha256<TAB>status<TAB>pages<TAB>tokens<TAB>output
-           status is "parsed" (ran now) or "cached" (served from the store)
-           output is the path to document.md
+  parse:   file<TAB>sha256<TAB>status<TAB>pages<TAB>tokens<TAB>output<TAB>task
+           status is "parsed" (ran now), "cached" (served from the store), or
+           "queued" (when --no-wait was passed; output and tokens are empty then).
+           pages reflects pages actually parsed (matches meta.json's pages_done),
+           NOT the PDF's total page count. task is the server task_id — useful
+           for grep'ing `ocrc queue` output.
   queue:   position<TAB>task<TAB>agent<TAB>sha256<TAB>mode<TAB>pages<TAB>status
   search:  sha256<TAB>file<TAB>mode<TAB>snippet
   stats:   key<TAB>value
 
   stdout is ONLY the TSV. Progress, waiting and errors go to stderr, so
   `ocrc parse x.pdf | cut -f6` is safe.
+
+  search rejects empty or >200-char queries with exit code 2. When a query
+  returns 0 rows, a `no matches` notice is printed to stderr (the TSV still
+  carries only the header on stdout).
 
 PROMPT MODES  (--prompt-mode, default prompt_layout_all_en)
   prompt_layout_all_en   blocks + categories + text -> markdown  (the usual one)
