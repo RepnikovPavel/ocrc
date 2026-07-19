@@ -559,12 +559,22 @@ def _cmd_parse_split(args, pipe_bundle):
         return idx, chunk, sha, cached
 
     chunk_results = [None] * len(chunks)
+    chunk_errors = {}
     with ThreadPoolExecutor(max_workers=len(chunks),
                             thread_name_prefix="ocrc-split") as pool:
         futures = [pool.submit(_do_chunk, i, c) for i, c in enumerate(chunks)]
         try:
             for fut in as_completed(futures):
                 idx, chunk, sha, cached = fut.result()
+                # Check if the task actually succeeded — wait_for may have
+                # returned with status=error or cancelled.
+                state = status(args.server, sha, args.prompt_mode)
+                task_status = state.get("status", "")
+                if task_status in ("error", "cancelled"):
+                    chunk_errors[idx] = state.get("error") or task_status
+                    if not args.quiet:
+                        log(f"ocrc: chunk {idx} FAILED: {chunk_errors[idx]}")
+                    continue
                 chunk_results[idx] = (chunk, sha, cached)
                 if not args.quiet:
                     log(f"ocrc: chunk {idx} ({len(chunk)} pages) "
@@ -573,6 +583,15 @@ def _cmd_parse_split(args, pipe_bundle):
             for fut in futures:
                 fut.cancel()
             raise
+
+    # If ANY chunk failed, refuse to merge a partial document.
+    if chunk_errors:
+        failed = ", ".join(f"chunk {i} ({chunks[i][0]}-{chunks[i][-1]})" for i in sorted(chunk_errors))
+        raise SystemExit(
+            f"ocrc: {len(chunk_errors)}/{len(chunks)} chunk(s) failed ({failed}). "
+            f"Refusing to return a partial document. "
+            f"Re-run the command to retry (successful chunks are cached)."
+        )
 
     # Merge: stream all bundles into a single zip on stdout (or unpack to --out).
     buffer = io.BytesIO()
