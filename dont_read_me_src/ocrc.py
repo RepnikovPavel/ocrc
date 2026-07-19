@@ -194,6 +194,23 @@ def status(server, sha256, mode):
     return _request(f"{server}/api/v1/documents/{sha256}?{query}")
 
 
+def _bundle_url(server, sha256, mode, pages):
+    """Build the bundle URL with explicit ?pages= when the user passed --pages.
+
+    The server keeps one cached result per (sha256, mode, page selection), so
+    when several selections exist for the same document the bundle endpoint
+    needs to know which one we mean. Without `?pages=` the server falls back
+    to the fullest parse, which is what we want for the default `ocrc parse`
+    case anyway — but when the user explicitly passed `--pages 0,1,2` we MUST
+    forward it, otherwise a later fuller or sparser parse could shadow the
+    exact slice the user asked for.
+    """
+    query = {"prompt_mode": mode}
+    if pages:  # the raw --pages string as the user typed it
+        query["pages"] = pages
+    return f"{server}/api/v1/documents/{sha256}/bundle?{urllib.parse.urlencode(query)}"
+
+
 def wait_for(server, sha256, mode, poll=3.0, quiet=False):
     """Block until the document is parsed, reporting progress to stderr."""
     last = None
@@ -211,10 +228,15 @@ def wait_for(server, sha256, mode, poll=3.0, quiet=False):
         time.sleep(poll)
 
 
-def fetch_bundle(server, sha256, mode, out_dir, extract=True):
-    query = urllib.parse.urlencode({"prompt_mode": mode})
-    payload = _request(f"{server}/api/v1/documents/{sha256}/bundle?{query}",
-                       timeout=max(TIMEOUT, 300), raw=True)
+def fetch_bundle(server, sha256, mode, out_dir, pages=None, extract=True):
+    """Download the result bundle (zip) and optionally unpack it.
+
+    `pages` is the raw --pages string from the user; when present it's
+    forwarded to the server so the right cached parse is served (matters when
+    a document has been parsed at several page selections).
+    """
+    url = _bundle_url(server, sha256, mode, pages)
+    payload = _request(url, timeout=max(TIMEOUT, 300), raw=True)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     archive = out_dir / f"{sha256[:12]}.zip"
@@ -316,8 +338,7 @@ def cmd_parse(args):
         # In pipe mode we stream the raw zip bytes straight to stdout, skipping
         # the unpack-to-disk step entirely. `--out` is ignored in this mode.
         if pipe_bundle:
-            query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode})
-            url = f"{args.server}/api/v1/documents/{sha256}/bundle?{query}"
+            url = _bundle_url(args.server, sha256, args.prompt_mode, args.pages)
             request = urllib.request.Request(url)
             # Stream in 64 KiB chunks so big bundles don't double-buffer.
             with urllib.request.urlopen(request, timeout=max(TIMEOUT, 300)) as response:
@@ -335,7 +356,7 @@ def cmd_parse(args):
             return
 
         out, markdown = fetch_bundle(args.server, sha256, args.prompt_mode,
-                                     args.out, extract=not args.zip)
+                                     args.out, pages=args.pages, extract=not args.zip)
         state = status(args.server, sha256, args.prompt_mode)
         rows.append((
             display_name, sha256,
