@@ -11,14 +11,36 @@ WHAT IT DOES
   Python 3 standard library only — no pip install, no virtualenv.
 
 HOW TO CALL
-  ocrc parse paper.pdf                  # parse everything, wait, unpack to ./ocrc-out
+  ocrc parse paper.pdf                  # parse the ENTIRE document, every page
+  ocrc parse https://arxiv.org/pdf/2606.19348 > out.zip
+                                        # URL source, bundle streamed to stdout
   ocrc parse a.pdf b.pdf --out /tmp/x   # several documents
-  ocrc parse paper.pdf --pages 0,1,2    # 0-based page selection
+  ocrc parse paper.pdf --pages 0,1,2    # only these 0-based pages
   ocrc parse paper.pdf --no-wait        # queue it and return immediately
   ocrc queue                            # who is waiting, in order
   ocrc watch                            # follow the queue as events arrive
   ocrc search "attention"               # full-text over everything parsed
   ocrc stats                            # store size, cache reuse, engine state
+
+  PAGE SELECTION
+    Omit --pages to parse every page in the document (the default). Parsing
+    takes ~10-30s PER PAGE, so a 50-page PDF is 10-20 minutes; for long
+    documents either be patient or pass --pages with the pages you need.
+
+  SOURCES
+    Any arg starting with http:// or https:// is downloaded to a temp file
+    first, then uploaded. The URL-decoded basename is kept as the filename
+    so the server's filename column stays meaningful.
+
+  OUTPUT TO STDOUT
+    When stdout is piped/redirected AND there is exactly one input, the bundle
+    (zip) is streamed to stdout and a one-line TSV summary goes to stderr:
+      ocrc parse URL > out.zip          # bundle on stdout, summary on stderr
+      ocrc parse URL                    # in a TTY: bundle saved under ./ocrc-out
+      ocrc parse a.pdf b.pdf            # multiple inputs → TSV on stdout as usual
+    Do NOT redirect both streams into the same file (`> out 2>&1` / `&> out`):
+    ocrc refuses rather than corrupt the zip with its own log lines. Use
+    `--quiet` to suppress progress, or split with `> out.zip 2> log.txt`.
 
   Server address: --server URL, or env OCRC_SERVER (default http://127.0.0.1:8601)
 
