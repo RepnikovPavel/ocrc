@@ -594,35 +594,51 @@ def _cmd_parse_split(args, pipe_bundle):
         )
 
     # Merge: stream all bundles into a single zip on stdout (or unpack to --out).
+    # Each chunk's bundle is fetched exactly once and kept in memory; the merged
+    # archive is assembled from those payloads without re-downloading.
+    chunk_payloads = []  # bundle bytes, indexed in parallel with chunk_results
+    for chunk, sha, _cached in chunk_results:
+        query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode,
+                                        "pages": ",".join(str(p) for p in chunk)})
+        url = f"{args.server}/api/v1/documents/{sha}/bundle?{query}"
+        chunk_payloads.append(_request(url, timeout=max(TIMEOUT, 600), raw=True))
+
     buffer = io.BytesIO()
     total_tokens = 0
     total_seconds = 0.0
     total_pages_done = 0
+    merged_pieces = []
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for chunk, sha, _cached in chunk_results:
-            query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode,
-                                            "pages": ",".join(str(p) for p in chunk)})
-            url = f"{args.server}/api/v1/documents/{sha}/bundle?{query}"
-            payload = _request(url, timeout=max(TIMEOUT, 600), raw=True)
+        for (chunk, _sha, _cached), payload in zip(chunk_results, chunk_payloads):
             with zipfile.ZipFile(io.BytesIO(payload)) as inner:
-                document_md = inner.read("document.md").decode("utf-8", "replace")
+                chunk_md = inner.read("document.md").decode("utf-8", "replace")
                 meta = json.loads(inner.read("meta.json"))
-                total_tokens += meta.get("generated_tokens") or 0
-                total_seconds += meta.get("seconds") or 0
-                total_pages_done += meta.get("pages_done") or 0
-                # Append the chunk's markdown as a separate file named by its
-                # page range; the merged document.md is the concatenation.
-                range_name = f"chunk_{chunk[0]:03d}-{chunk[-1]:03d}.md"
-                archive.writestr(range_name, document_md)
-                # Carry images/layout files with a chunk-prefixed name so they
-                # never collide between chunks.
-                for name in inner.namelist():
-                    if name in ("document.md", "meta.json"):
-                        continue
-                    archive.writestr(f"chunk_{chunk[0]:03d}/{name}",
-                                     inner.read(name))
-        # Build the merged document.md: chunks in order, double-newline separated.
-        archive.writestr("document.md", _merge_markdown_from_chunks(chunk_results, args))
+                inner_names = inner.namelist()
+                inner_files = {name: inner.read(name) for name in inner_names
+                               if name not in ("document.md", "meta.json")}
+            total_tokens += meta.get("generated_tokens") or 0
+            total_seconds += meta.get("seconds") or 0
+            total_pages_done += meta.get("pages_done") or 0
+
+            prefix = f"chunk_{chunk[0]:03d}"
+            # Rewrite this chunk's image links so they resolve INSIDE the merged
+            # archive: the bundle's md says `images/foo.png` (relative to the
+            # chunk's own folder), but we store the chunk's images under
+            # `chunk_XXX/images/`. Without this rewrite, every link in the merged
+            # document.md and in the per-chunk .md would be broken after unpack.
+            chunk_md = _rewrite_image_links(chunk_md, prefix)
+            merged_pieces.append(chunk_md)
+
+            # Per-chunk markdown as a separate file, named by its page range.
+            archive.writestr(f"chunk_{chunk[0]:03d}-{chunk[-1]:03d}.md", chunk_md)
+            # Carry images/layout files with a chunk-prefixed name so they
+            # never collide between chunks.
+            for name, data in inner_files.items():
+                archive.writestr(f"{prefix}/{name}", data)
+
+        # Merged document.md: chunks in order, double-newline separated. Each
+        # piece already has image links rewritten to its own chunk_XXX/images/.
+        archive.writestr("document.md", "\n\n".join(merged_pieces))
         merged_meta = {
             "sha256": "(split — see per-chunk bundles)",
             "prompt_mode": args.prompt_mode,
@@ -651,17 +667,16 @@ def _cmd_parse_split(args, pipe_bundle):
                str(total_pages_done), str(total_tokens), str(archive_path), "")])
 
 
-def _merge_markdown_from_chunks(chunk_results, args):
-    """Read document.md from each chunk bundle (in order) and concatenate."""
-    pieces = []
-    for chunk, sha, _cached in chunk_results:
-        query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode,
-                                        "pages": ",".join(str(p) for p in chunk)})
-        url = f"{args.server}/api/v1/documents/{sha}/bundle?{query}"
-        payload = _request(url, timeout=max(TIMEOUT, 600), raw=True)
-        with zipfile.ZipFile(io.BytesIO(payload)) as inner:
-            pieces.append(inner.read("document.md").decode("utf-8", "replace"))
-    return "\n\n".join(pieces)
+def _rewrite_image_links(md, prefix):
+    """Rewrite `images/...` picture links to `prefix/images/...`.
+
+    Each chunk's bundle ships its markdown with links relative to the chunk's
+    own folder (`images/foo.png`). In the merged archive those files live under
+    `chunk_XXX/images/`, so the links must be prefixed to keep resolving.
+    Layout-relative links (`layout/...`, never produced by the parser as in-md
+    links) are left alone.
+    """
+    return md.replace("](images/", f"]({prefix}/images/")
 
 
 def _materialise_input(path, args):
