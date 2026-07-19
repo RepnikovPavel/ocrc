@@ -165,24 +165,52 @@ def cmd_parse(args):
             raise SystemExit(f"ocrc: no such file: {path}")
         submitted = submit(args.server, path, args.prompt_mode, args.pages, args.agent)
         sha256 = submitted["sha256"]
-        cached = submitted["status"] == "cached"
+        status_resp = submitted.get("status", "")
+        cached = status_resp == "cached"
+        # submit response carries `pages` as the actual page list the server
+        # will parse (e.g. [0] for --pages 0, [0,1,2] for --pages 0,1,2). Use
+        # its length as the truthful "pages to parse" count — NOT num_pages,
+        # which is the PDF page count and is misreported by the server today
+        # (see issue RepnikovPavel/ocr#10).
+        page_list = submitted.get("pages") or []
+        pages_to_parse = len(page_list) if isinstance(page_list, list) else ""
+        task_id = submitted.get("task_id") or ""
+
         if not cached and not args.no_wait:
             wait_for(args.server, sha256, args.prompt_mode, quiet=args.quiet)
         elif not cached:
-            rows.append((Path(path).name, sha256, "queued", "", "", ""))
+            # Surface what the server already knows (task_id + pages actually
+            # queued) so a follow-up `ocrc queue | grep <task>` is one step.
+            rows.append((Path(path).name, sha256, "queued",
+                         str(pages_to_parse), "", "", str(task_id)))
             continue
 
         out, markdown = fetch_bundle(args.server, sha256, args.prompt_mode,
                                      args.out, extract=not args.zip)
-        state = status(args.server, sha256, args.prompt_mode)
+        # Pull truthful pages/tokens from the unpacked meta.json when we can —
+        # it's the only source that reflects what the worker actually did.
+        meta_pages = pages_to_parse
+        meta_tokens = ""
+        meta_task = task_id
+        if markdown:
+            meta_path = Path(markdown).parent / "meta.json"
+            if meta_path.is_file():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    meta_pages = meta.get("pages_done", meta_pages)
+                    meta_tokens = str(meta.get("generated_tokens") or "")
+                    meta_task = meta.get("task_id", meta_task)
+                except (ValueError, OSError):
+                    pass
         rows.append((
             Path(path).name, sha256,
             "cached" if cached else "parsed",
-            str(state.get("num_pages") or ""),
-            str(state.get("generated_tokens") or ""),
+            str(meta_pages),
+            meta_tokens,
             str(markdown or out),
+            str(meta_task),
         ))
-    emit(["file", "sha256", "status", "pages", "tokens", "output"], rows)
+    emit(["file", "sha256", "status", "pages", "tokens", "output", "task"], rows)
 
 
 def cmd_queue(args):
@@ -221,12 +249,25 @@ def cmd_watch(args):
 
 
 def cmd_search(args):
-    query = urllib.parse.urlencode({"q": args.query, "limit": args.limit})
+    q = (args.query or "").strip()
+    if not q:
+        # Usage error → exit 2, matching argparse's own behaviour for bad input.
+        log("ocrc: empty search query (pass a non-empty term, "
+            "or use a future `ocrc list` to enumerate documents)")
+        sys.exit(2)
+    if len(q) > 200:
+        log(f"ocrc: query too long ({len(q)} chars, max 200) — narrow your search")
+        sys.exit(2)
+    query = urllib.parse.urlencode({"q": q, "limit": args.limit})
     data = _request(f"{args.server}/api/v1/documents?{query}")
     rows = [(r.get("sha256", "")[:12], r.get("filename", ""), r.get("prompt_mode", ""),
              (r.get("snippet") or "").replace("\t", " ").replace("\n", " ")[:120])
-            for r in data["results"]]
+            for r in data.get("results", [])]
     emit(["sha256", "file", "mode", "snippet"], rows)
+    # Surface "server returned nothing" distinctly from "0 matches". Today the
+    # server can silently swallow a too-long query; if you hit this, narrow it.
+    if not rows:
+        log(f"ocrc: no matches for {q!r}")
 
 
 def cmd_stats(args):
