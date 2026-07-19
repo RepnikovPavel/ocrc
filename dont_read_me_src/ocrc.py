@@ -16,7 +16,9 @@ import hashlib
 import json
 import mimetypes
 import os
+import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -103,6 +105,83 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
+def is_url(s):
+    """True when the argument looks like an http(s) URL we should fetch first."""
+    return isinstance(s, str) and (
+        s.startswith("http://") or s.startswith("https://")
+    )
+
+
+def fetch_url_to_temp(url, dest_dir):
+    """Download a URL into dest_dir, returning the local path.
+
+    Uses the URL-decoded basename as filename when it carries a usable
+    extension (so the server's `filename` column stays meaningful). When the
+    basename has no extension — common for arXiv URLs like
+    `https://arxiv.org/pdf/2606.19348` — we derive one from the Content-Type
+    header, falling back to `.pdf` since that's by far the dominant case for
+    document-fetching CLI tools.
+    """
+    parsed = urllib.parse.urlparse(url)
+    name = urllib.parse.unquote(os.path.basename(parsed.path or "")) or "download"
+    name = os.path.basename(name)  # sanitize to a single component
+    # Strip a trailing query-like tail if it slipped through (?foo=bar etc.)
+    if "?" in name:
+        name = name.split("?", 1)[0]
+    # If the basename's extension isn't one the service accepts, drop it so the
+    # Content-Type header (or the .pdf fallback below) can supply a real one.
+    # This is what fixes `https://arxiv.org/pdf/2606.19348` (basename
+    # "2606.19348" → ext ".19348", not accepted → drop → "2606" → ".pdf").
+    _, ext = os.path.splitext(name)
+    if ext.lower() not in _KNOWN_EXTS:
+        name = name[: -len(ext)] if ext else name
+
+    dest = Path(dest_dir) / name
+    req = urllib.request.Request(url, headers={"User-Agent": f"ocrc/{__version__}"})
+    log(f"ocrc: downloading {url}")
+    with urllib.request.urlopen(req, timeout=max(TIMEOUT, 300)) as response:
+        # If we ended up without a known extension, derive one from the
+        # Content-Type header; default to .pdf (the dominant case for this CLI).
+        if os.path.splitext(dest.name)[1].lower() not in _KNOWN_EXTS:
+            ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+            suffix = _EXT_BY_CTYPE.get(ctype.lower()) or ".pdf"
+            dest = dest.with_suffix(suffix)
+        with open(dest, "wb") as out:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+    log(f"ocrc: saved {dest.stat().st_size} bytes → {dest.name}")
+    return str(dest)
+
+
+# Extensions the service accepts (PDF + common image formats). Used to decide
+# whether a URL basename like "2606.19348" needs a suffix appended.
+_KNOWN_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".gif",
+               ".bmp"}
+
+# Content-Type → file extension, used when the URL has no usable suffix.
+_EXT_BY_CTYPE = {
+    "application/pdf": ".pdf",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/tiff": ".tif",
+    "image/gif": ".gif",
+}
+
+
+def is_stdout_piped():
+    """True when stdout is being redirected/piped (so writing the bundle there
+    won't trash an interactive terminal)."""
+    try:
+        return not os.isatty(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return True
+
+
 def submit(server, path, mode, pages, agent):
     fields = {"prompt_mode": mode, "pages": pages, "agent": agent}
     body, ctype = _multipart(fields, file_field=("file", path))
@@ -158,31 +237,115 @@ def fetch_bundle(server, sha256, mode, out_dir, extract=True):
 # commands
 # --------------------------------------------------------------------------
 
+def _stdout_stderr_same_file():
+    """Detect `> out 2>&1` / `&> out` — same file on both descriptors.
+
+    Streaming the zip bundle to stdout in that case would corrupt it with the
+    log lines we also write to stderr. We refuse up-front instead of leaving
+    the user with a half-broken archive.
+    """
+    try:
+        so = os.fstat(sys.stdout.fileno())
+        se = os.fstat(sys.stderr.fileno())
+    except (OSError, ValueError):
+        return False
+    return so.st_dev == se.st_dev and so.st_ino == se.st_ino
+
+
 def cmd_parse(args):
+    # When stdout is piped/redirected AND exactly one input is given, the
+    # bundle (.zip) goes to stdout so `ocrc parse URL > out.zip` works.
+    # TSV remains on stdout when: many inputs, --no-wait, or stdout is a TTY.
+    # The latter guards against a user typing `ocrc parse URL` interactively
+    # and having binary zip bytes dumped into their terminal.
+    pipe_bundle = (
+        is_stdout_piped()
+        and len(args.paths) == 1
+        and not args.no_wait
+    )
+    # Refuse the pipe path when stdout and stderr point at the same file —
+    # that's `> out 2>&1` / `&> out`, and our log lines would land inside the
+    # zip and corrupt it. Tell the user how to split the streams.
+    if pipe_bundle and _stdout_stderr_same_file():
+        raise SystemExit(
+            "ocrc: refusing to write the bundle to a file that also receives "
+            "stderr (you used `> FILE 2>&1` or `&> FILE` — log lines would "
+            "corrupt the zip). Use one of:\n"
+            "    ocrc parse URL > out.zip              (stderr stays on terminal)\n"
+            "    ocrc parse URL > out.zip 2> log.txt   (split the streams)\n"
+            "    ocrc parse URL --quiet > out.zip      (suppress progress log)"
+        )
+
     rows = []
     for path in args.paths:
-        if not Path(path).is_file():
-            raise SystemExit(f"ocrc: no such file: {path}")
-        submitted = submit(args.server, path, args.prompt_mode, args.pages, args.agent)
+        # URL → download to a temp file first. Keep the temp file around long
+        # enough to be uploaded by name (so the server's `filename` field is
+        # meaningful), then drop it.
+        cleanup = None
+        if is_url(path):
+            tmpdir = tempfile.mkdtemp(prefix="ocrc-dl-")
+            cleanup = lambda: shutil.rmtree(tmpdir, ignore_errors=True)  # noqa: E731
+            try:
+                local = fetch_url_to_temp(path, tmpdir)
+            except Exception as error:  # noqa: BLE001 — show the URL, clean up
+                cleanup()
+                raise SystemExit(f"ocrc: failed to download {path}: {error}")
+            display_name = Path(path).name or Path(local).name
+            upload_path = local
+        else:
+            if not Path(path).is_file():
+                raise SystemExit(f"ocrc: no such file: {path}")
+            display_name = Path(path).name
+            upload_path = path
+
+        try:
+            submitted = submit(args.server, upload_path, args.prompt_mode,
+                               args.pages, args.agent)
+        finally:
+            if cleanup:
+                cleanup()
+
         sha256 = submitted["sha256"]
         cached = submitted["status"] == "cached"
         if not cached and not args.no_wait:
             wait_for(args.server, sha256, args.prompt_mode, quiet=args.quiet)
         elif not cached:
-            rows.append((Path(path).name, sha256, "queued", "", "", ""))
+            rows.append((display_name, sha256, "queued", "", "", "", ""))
             continue
+
+        # In pipe mode we stream the raw zip bytes straight to stdout, skipping
+        # the unpack-to-disk step entirely. `--out` is ignored in this mode.
+        if pipe_bundle:
+            query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode})
+            url = f"{args.server}/api/v1/documents/{sha256}/bundle?{query}"
+            request = urllib.request.Request(url)
+            # Stream in 64 KiB chunks so big bundles don't double-buffer.
+            with urllib.request.urlopen(request, timeout=max(TIMEOUT, 300)) as response:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            # TSV summary still goes to stderr so progress/scripts can capture it.
+            state = status(args.server, sha256, args.prompt_mode)
+            log(f"ocrc: {display_name}\t{sha256}\t"
+                f"{'cached' if cached else 'parsed'}\t"
+                f"{state.get('generated_tokens') or ''}")
+            return
 
         out, markdown = fetch_bundle(args.server, sha256, args.prompt_mode,
                                      args.out, extract=not args.zip)
         state = status(args.server, sha256, args.prompt_mode)
         rows.append((
-            Path(path).name, sha256,
+            display_name, sha256,
             "cached" if cached else "parsed",
             str(state.get("num_pages") or ""),
             str(state.get("generated_tokens") or ""),
             str(markdown or out),
+            str(state.get("task_id") or ""),
         ))
-    emit(["file", "sha256", "status", "pages", "tokens", "output"], rows)
+    emit(["file", "sha256", "status", "pages", "tokens", "output", "task"], rows)
 
 
 def cmd_queue(args):
@@ -262,9 +425,14 @@ def build_parser():
     sub = parser.add_subparsers(dest="command")
 
     parse = sub.add_parser("parse", help="parse documents and download the result")
-    parse.add_argument("paths", nargs="+", help="PDF or image files")
+    parse.add_argument("paths", nargs="+",
+                       help="PDF or image files, or http(s):// URLs to fetch first")
     parse.add_argument("--prompt-mode", default=DEFAULT_MODE, dest="prompt_mode")
-    parse.add_argument("--pages", default=None, help="0-based, e.g. 0,1,2 (default: all)")
+    parse.add_argument("--pages", default=None,
+                       help="0-based page selection, e.g. 0,1,2. "
+                            "OMIT to parse the ENTIRE document (every page). "
+                            "Parsing is ~10-30s per page, so for long PDFs "
+                            "either be patient or pass --pages.")
     parse.add_argument("--out", default="./ocrc-out", help="where to put results")
     parse.add_argument("--agent", default=DEFAULT_AGENT, help="name shown in the queue")
     parse.add_argument("--no-wait", action="store_true", help="queue and exit")

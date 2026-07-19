@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
-ocrc-out/
+.pytest_cache/
+.venv/
+out.zip
