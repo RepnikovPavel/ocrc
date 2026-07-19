@@ -211,11 +211,41 @@ def _bundle_url(server, sha256, mode, pages):
     return f"{server}/api/v1/documents/{sha256}/bundle?{urllib.parse.urlencode(query)}"
 
 
-def wait_for(server, sha256, mode, poll=3.0, quiet=False):
-    """Block until the document is parsed, reporting progress to stderr."""
+def wait_for(server, sha256, mode, poll=3.0, quiet=False,
+             max_transient_errors=10):
+    """Block until the document is parsed, reporting progress to stderr.
+
+    Long documents (50+ pages) take 15-30 minutes to parse. During that time
+    a single transient network blip or a brief 5xx from the service MUST NOT
+    kill the wait — the parse keeps running server-side and we should ride
+    through it. We retry transient errors up to `max_transient_errors` times
+    in a row before giving up; terminal statuses (error/cancelled) still
+    exit immediately.
+    """
     last = None
+    consecutive_errors = 0
     while True:
-        state = status(server, sha256, mode)
+        try:
+            state = _status_with_retry(server, sha256, mode)
+            consecutive_errors = 0
+        except (_TransientError, urllib.error.URLError,
+                urllib.error.HTTPError) as error:
+            consecutive_errors += 1
+            code = getattr(error, "code", None)
+            # 5xx and network errors are transient — keep waiting. 4xx is not
+            # (the document/endpoint is wrong); let it bubble.
+            if isinstance(error, urllib.error.HTTPError) and code and code < 500:
+                raise
+            if consecutive_errors >= max_transient_errors:
+                raise SystemExit(
+                    f"ocrc: gave up after {consecutive_errors} consecutive "
+                    f"errors while polling {sha256[:12]}: {error}")
+            if not quiet:
+                log(f"ocrc: {sha256[:12]} transient error "
+                    f"({consecutive_errors}/{max_transient_errors}): {error}")
+            time.sleep(min(poll * consecutive_errors, 30))
+            continue
+
         if state.get("cached") or state.get("status") == "done":
             return state
         if state.get("status") in {"error", "cancelled"}:
@@ -226,6 +256,37 @@ def wait_for(server, sha256, mode, poll=3.0, quiet=False):
             log(f"ocrc: {sha256[:12]} {state.get('status')} {line}")
             last = line
         time.sleep(poll)
+
+
+class _TransientError(Exception):
+    """Marker for retryable poll failures (timeouts, incomplete JSON)."""
+
+
+def _status_with_retry(server, sha256, mode):
+    """Status poll that retries short read timeouts instead of dying.
+
+    A long parse doesn't make the service slow on /documents/<sha> — that
+    endpoint is a fast DB lookup — but under load it can occasionally take
+    longer than `OCRC_TIMEOUT` to write the response. One slow poll should
+    not abort a 25-minute wait.
+    """
+    last_error = None
+    for attempt in range(3):
+        try:
+            return status(server, sha256, mode)
+        except urllib.error.HTTPError as error:
+            # 5xx → retry; 4xx → propagate (real error).
+            if error.code >= 500:
+                last_error = error
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+        except urllib.error.URLError as error:
+            # Socket timeout, connection reset, DNS hiccup — retry.
+            last_error = error
+            time.sleep(2 * (attempt + 1))
+            continue
+    raise _TransientError(f"status poll failed after retries: {last_error}")
 
 
 def fetch_bundle(server, sha256, mode, out_dir, pages=None, extract=True):
