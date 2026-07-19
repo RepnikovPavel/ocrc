@@ -13,6 +13,7 @@ progress, waiting, errors — goes to stderr and never pollutes the data stream.
 
 import argparse
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -359,6 +360,13 @@ def cmd_parse(args):
             "    ocrc parse URL --quiet > out.zip      (suppress progress log)"
         )
 
+    # --split N: fan a single document out across N parallel tasks so a
+    # multi-GPU server (DEMO_VLLM_URLS with N endpoints) parses N page-ranges
+    # at once. The merged bundle goes to stdout / --out exactly like the
+    # single-task path, but the wall-clock time approaches 1/N for long PDFs.
+    if getattr(args, "split", 1) and args.split > 1:
+        return _cmd_parse_split(args, pipe_bundle)
+
     rows = []
     for path in args.paths:
         # URL → download to a temp file first. Keep the temp file around long
@@ -455,6 +463,204 @@ def cmd_parse(args):
             str(meta_task),
         ))
     emit(["file", "sha256", "status", "pages", "tokens", "output", "task"], rows)
+
+
+def _chunk_pages(page_list, n):
+    """Split a list of pages into n roughly-equal contiguous chunks.
+
+    Used by --split to fan a single document across N parallel tasks on a
+    multi-GPU server. Contiguous chunks (not round-robin) so each task's
+    markdown reads as a continuous run of pages — easier to inspect and
+    closer to how a single-task parse would have ordered them.
+    """
+    if n <= 1 or not page_list:
+        return [list(page_list)]
+    pages = sorted(page_list)
+    chunks = []
+    chunk_size = (len(pages) + n - 1) // n
+    for i in range(0, len(pages), chunk_size):
+        chunks.append(pages[i:i + chunk_size])
+    return chunks
+
+
+def _submit_and_wait(server, path, mode, agent, pages_str, quiet=False,
+                     poll=3.0):
+    """One-shot submit + wait_for + return sha256. Used by _cmd_parse_split."""
+    submitted = submit(server, path, mode, pages_str, agent)
+    sha256 = submitted["sha256"]
+    cached = submitted.get("status") == "cached"
+    if not cached:
+        wait_for(server, sha256, mode, quiet=quiet, poll=poll)
+    return sha256, cached
+
+
+def _cmd_parse_split(args, pipe_bundle):
+    """Fan a single document across N parallel tasks on a multi-GPU server.
+
+    Each chunk is submitted as its own task with its own page selection; the
+    server's queue dispatches them to separate workers (= separate GPUs).
+    We wait for all of them, fetch every bundle, and merge them into one
+    output: a single zip on stdout (in pipe mode) or one folder in --out.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if len(args.paths) != 1:
+        raise SystemExit("ocrc: --split currently supports exactly one input")
+    path = args.paths[0]
+
+    # Resolve pages to a concrete list so we can chunk it. If the user didn't
+    # pass --pages, we need the document's page count first — submit once
+    # with --pages 0 to discover it (the server returns num_pages), then
+    # cancel / ignore that task and use the full range.
+    pages_str = args.pages
+    if pages_str:
+        try:
+            page_list = sorted({int(x) for x in pages_str.split(",") if x.strip()})
+        except ValueError:
+            raise SystemExit(f"ocrc: bad --pages: {pages_str}")
+    else:
+        # Discover page count via a probe submit of page 0. The probe task
+        # parses one page (cheap), but we don't actually use its result —
+        # we only need `num_pages`. To avoid wasting the work, if the doc
+        # turns out to have N pages and we'll split into k chunks, we keep
+        # this probe as one of the chunks (page 0's chunk).
+        probe_path = _materialise_input(path, args)
+        probe = submit(args.server, probe_path, args.prompt_mode, "0", args.agent)
+        num_pages = probe.get("num_pages")
+        if not isinstance(num_pages, int) or num_pages < 1:
+            raise SystemExit("ocrc: could not determine page count from server; "
+                             "pass --pages explicitly with --split")
+        page_list = list(range(num_pages))
+        pages_str = ",".join(str(p) for p in page_list)
+        # Reuse probe_path for the chunks below so we don't re-download.
+        path = probe_path
+
+    chunks = _chunk_pages(page_list, args.split)
+    if len(chunks) == 1:
+        # Nothing to split (too few pages); fall back to the normal path by
+        # recursing with split disabled.
+        args.split = 1
+        return cmd_parse(args)
+
+    if not quiet_or_silent(args):
+        log(f"ocrc: --split {args.split} → {len(chunks)} chunks of "
+            f"{[len(c) for c in chunks]} pages each, dispatched in parallel")
+
+    # Materialise the input file once if we haven't already (URL → temp file).
+    if not Path(path).is_file():
+        path = _materialise_input(path, args)
+    display_name = Path(path).name
+
+    def _do_chunk(idx, chunk):
+        chunk_str = ",".join(str(p) for p in chunk)
+        sha, cached = _submit_and_wait(args.server, path, args.prompt_mode,
+                                       f"{args.agent}-chunk{idx}",
+                                       chunk_str, quiet=args.quiet)
+        return idx, chunk, sha, cached
+
+    chunk_results = [None] * len(chunks)
+    with ThreadPoolExecutor(max_workers=len(chunks),
+                            thread_name_prefix="ocrc-split") as pool:
+        futures = [pool.submit(_do_chunk, i, c) for i, c in enumerate(chunks)]
+        try:
+            for fut in as_completed(futures):
+                idx, chunk, sha, cached = fut.result()
+                chunk_results[idx] = (chunk, sha, cached)
+                if not args.quiet:
+                    log(f"ocrc: chunk {idx} ({len(chunk)} pages) "
+                        f"{'cached' if cached else 'parsed'}")
+        except KeyboardInterrupt:
+            for fut in futures:
+                fut.cancel()
+            raise
+
+    # Merge: stream all bundles into a single zip on stdout (or unpack to --out).
+    buffer = io.BytesIO()
+    total_tokens = 0
+    total_seconds = 0.0
+    total_pages_done = 0
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for chunk, sha, _cached in chunk_results:
+            query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode,
+                                            "pages": ",".join(str(p) for p in chunk)})
+            url = f"{args.server}/api/v1/documents/{sha}/bundle?{query}"
+            payload = _request(url, timeout=max(TIMEOUT, 600), raw=True)
+            with zipfile.ZipFile(io.BytesIO(payload)) as inner:
+                document_md = inner.read("document.md").decode("utf-8", "replace")
+                meta = json.loads(inner.read("meta.json"))
+                total_tokens += meta.get("generated_tokens") or 0
+                total_seconds += meta.get("seconds") or 0
+                total_pages_done += meta.get("pages_done") or 0
+                # Append the chunk's markdown as a separate file named by its
+                # page range; the merged document.md is the concatenation.
+                range_name = f"chunk_{chunk[0]:03d}-{chunk[-1]:03d}.md"
+                archive.writestr(range_name, document_md)
+                # Carry images/layout files with a chunk-prefixed name so they
+                # never collide between chunks.
+                for name in inner.namelist():
+                    if name in ("document.md", "meta.json"):
+                        continue
+                    archive.writestr(f"chunk_{chunk[0]:03d}/{name}",
+                                     inner.read(name))
+        # Build the merged document.md: chunks in order, double-newline separated.
+        archive.writestr("document.md", _merge_markdown_from_chunks(chunk_results, args))
+        merged_meta = {
+            "sha256": "(split — see per-chunk bundles)",
+            "prompt_mode": args.prompt_mode,
+            "pages_done": total_pages_done,
+            "generated_tokens": total_tokens,
+            "seconds": round(total_seconds, 2),
+            "split_chunks": [
+                {"pages": c[0], "sha256": c[2]}
+                for c in chunk_results
+            ],
+        }
+        archive.writestr("meta.json", json.dumps(merged_meta, indent=2))
+
+    payload = buffer.getvalue()
+    if pipe_bundle:
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        log(f"ocrc: {display_name}\tsplit-merged\t{total_pages_done}\t{total_tokens}")
+    else:
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = out_dir / f"split-{int(time.time())}.zip"
+        archive_path.write_bytes(payload)
+        emit(["file", "sha256", "status", "pages", "tokens", "output", "task"],
+             [(display_name, "(split)", "parsed",
+               str(total_pages_done), str(total_tokens), str(archive_path), "")])
+
+
+def _merge_markdown_from_chunks(chunk_results, args):
+    """Read document.md from each chunk bundle (in order) and concatenate."""
+    pieces = []
+    for chunk, sha, _cached in chunk_results:
+        query = urllib.parse.urlencode({"prompt_mode": args.prompt_mode,
+                                        "pages": ",".join(str(p) for p in chunk)})
+        url = f"{args.server}/api/v1/documents/{sha}/bundle?{query}"
+        payload = _request(url, timeout=max(TIMEOUT, 600), raw=True)
+        with zipfile.ZipFile(io.BytesIO(payload)) as inner:
+            pieces.append(inner.read("document.md").decode("utf-8", "replace"))
+    return "\n\n".join(pieces)
+
+
+def _materialise_input(path, args):
+    """If `path` is a URL, download it to a temp file; otherwise return as-is."""
+    if is_url(path):
+        tmpdir = tempfile.mkdtemp(prefix="ocrc-dl-")
+        try:
+            return fetch_url_to_temp(path, tmpdir)
+        except Exception as error:  # noqa: BLE001
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise SystemExit(f"ocrc: failed to download {path}: {error}")
+    if not Path(path).is_file():
+        raise SystemExit(f"ocrc: no such file: {path}")
+    return path
+
+
+def quiet_or_silent(args):
+    return getattr(args, "quiet", False)
 
 
 def cmd_queue(args):
@@ -560,6 +766,9 @@ def build_parser():
     parse.add_argument("--no-wait", action="store_true", help="queue and exit")
     parse.add_argument("--zip", action="store_true", help="keep the archive instead of unpacking")
     parse.add_argument("--quiet", "-q", action="store_true", help="no progress on stderr")
+    parse.add_argument("--split", type=int, default=1,
+                       help="split the page list into N parallel tasks "
+                            "(use 2 on a 2-GPU server for ~2x speedup)")
     parse.set_defaults(func=cmd_parse)
 
     queue = sub.add_parser("queue", help="who is waiting, in order")
