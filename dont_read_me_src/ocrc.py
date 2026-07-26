@@ -290,12 +290,20 @@ def _status_with_retry(server, sha256, mode):
     raise _TransientError(f"status poll failed after retries: {last_error}")
 
 
-def fetch_bundle(server, sha256, mode, out_dir, pages=None, extract=True):
+def fetch_bundle(server, sha256, mode, out_dir, pages=None, extract=True, subdir=None):
     """Download the result bundle (zip) and optionally unpack it.
 
     `pages` is the raw --pages string from the user; when present it's
     forwarded to the server so the right cached parse is served (matters when
     a document has been parsed at several page selections).
+
+    `subdir` controls where inside `out_dir` the bundle is unpacked:
+      - None  : straight into `out_dir`           → `<out_dir>/document.md`
+      - "x"   : into `out_dir/x/`                 → `<out_dir>/x/document.md`
+    The single-input path passes None (a user asking for `--out bit` expects
+    `bit/document.md`, not `bit/<sha-prefix>/document.md`); the multi-input
+    path passes the per-input filename stem so several documents do not
+    clobber each other (`bit/paper/document.md`, `bit/report/document.md`).
     """
     url = _bundle_url(server, sha256, mode, pages)
     payload = _request(url, timeout=max(TIMEOUT, 300), raw=True)
@@ -305,7 +313,8 @@ def fetch_bundle(server, sha256, mode, out_dir, pages=None, extract=True):
     archive.write_bytes(payload)
     if not extract:
         return archive, None
-    target = out_dir / sha256[:12]
+    target = out_dir if subdir is None else (out_dir / subdir)
+    target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive) as bundle:
         # the archive is built by this service and contains only relative paths,
         # but a zip is untrusted input in general: refuse anything that escapes
@@ -347,6 +356,11 @@ def cmd_parse(args):
         and len(args.paths) == 1
         and not args.no_wait
     )
+    # Several inputs share one --out dir, so each goes into its own subfolder
+    # named after the input file (stem only) — `bit/paper/document.md`,
+    # `bit/report/document.md`. Single input goes straight into --out, which is
+    # what someone typing `ocrc parse URL --out bit` expects: `bit/document.md`.
+    multi = len(args.paths) > 1
     # Refuse the pipe path when stdout and stderr point at the same file —
     # that's `> out 2>&1` / `&> out`, and our log lines would land inside the
     # zip and corrupt it. Tell the user how to split the streams.
@@ -438,7 +452,8 @@ def cmd_parse(args):
             return
 
         out, markdown = fetch_bundle(args.server, sha256, args.prompt_mode,
-                                     args.out, pages=args.pages, extract=not args.zip)
+                                     args.out, pages=args.pages, extract=not args.zip,
+                                     subdir=Path(display_name).stem if multi else None)
         # Pull truthful pages/tokens from the unpacked meta.json when we can —
         # it's the only source that reflects what the worker actually did.
         meta_pages = pages_to_parse
@@ -795,7 +810,9 @@ def build_parser():
                             "OMIT to parse the ENTIRE document (every page). "
                             "Parsing is ~10-30s per page, so for long PDFs "
                             "either be patient or pass --pages.")
-    parse.add_argument("--out", default="./ocrc-out", help="where to put results")
+    parse.add_argument("--out", default="./ocrc-out",
+                       help="output dir; one input → <out>/document.md, "
+                            "several inputs → <out>/<stem>/document.md each")
     parse.add_argument("--agent", default=DEFAULT_AGENT, help="name shown in the queue")
     parse.add_argument("--no-wait", action="store_true", help="queue and exit")
     parse.add_argument("--zip", action="store_true", help="keep the archive instead of unpacking")

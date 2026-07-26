@@ -32,7 +32,8 @@ export OCRC_SERVER=http://127.0.0.1:8601      # or pass --server
 ```sh
 ocrc parse paper.pdf                    # parse, wait, unpack into ./ocrc-out
 ocrc parse paper.pdf --pages 0,1,2      # 0-based selection
-ocrc parse a.pdf b.pdf --out /tmp/x     # several at once
+ocrc parse paper.pdf --out /tmp/x       # one input → /tmp/x/document.md
+ocrc parse a.pdf b.pdf --out /tmp/x     # several inputs → /tmp/x/a/..., /tmp/x/b/...
 ocrc parse paper.pdf --no-wait          # queue and return
 
 ocrc queue                              # who is waiting, in order
@@ -40,6 +41,12 @@ ocrc watch                              # follow the queue as events arrive
 ocrc search "attention"                 # full-text over everything parsed
 ocrc stats                              # store size, cache reuse, engine state
 ```
+
+**`--out` layout.** One input is unpacked straight into the directory you name
+(`ocrc parse paper.pdf --out bit` → `bit/document.md`). Several inputs get one
+subfolder each, named after the input file stem (`ocrc parse a.pdf b.pdf --out
+bit` → `bit/a/document.md`, `bit/b/document.md`) — so nothing clobbers anything
+and the paths stay agent-readable.
 
 Output is TSV, so it composes:
 

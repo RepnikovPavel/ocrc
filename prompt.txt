@@ -12,15 +12,23 @@ WHAT IT DOES
 
 HOW TO CALL
   ocrc parse paper.pdf                  # parse the ENTIRE document, every page
+  ocrc parse paper.pdf --out bit        # one input → bit/document.md
   ocrc parse https://arxiv.org/pdf/2606.19348 > out.zip
                                         # URL source, bundle streamed to stdout
-  ocrc parse a.pdf b.pdf --out /tmp/x   # several documents
+  ocrc parse a.pdf b.pdf --out /tmp/x   # several inputs → /tmp/x/a/..., /tmp/x/b/...
   ocrc parse paper.pdf --pages 0,1,2    # only these 0-based pages
   ocrc parse paper.pdf --no-wait        # queue it and return immediately
   ocrc queue                            # who is waiting, in order
   ocrc watch                            # follow the queue as events arrive
   ocrc search "attention"               # full-text over everything parsed
   ocrc stats                            # store size, cache reuse, engine state
+
+  --out LAYOUT
+    One input is unpacked straight into the directory you name:
+      ocrc parse paper.pdf --out bit    →  bit/document.md
+    Several inputs get one subfolder each, named after the input file stem:
+      ocrc parse a.pdf b.pdf --out bit  →  bit/a/document.md, bit/b/document.md
+    Nothing clobbers anything and the paths are agent-readable (no sha hashes).
 
   PAGE SELECTION
     Omit --pages to parse every page in the document (the default). Parsing
