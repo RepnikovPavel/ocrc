@@ -19,6 +19,14 @@ Needs `python3 >= 3.8` and a reachable service.
 export OCRC_SERVER=http://127.0.0.1:8601      # or pass --server
 ```
 
+> **Running the service itself?** `ocrc` only consumes a dots.mocr service; it
+> does not start one. To deploy/develop the server, see
+> [ocr/AGENTS.md](https://github.com/RepnikovPavel/ocr/blob/main/AGENTS.md)
+> (code map, env vars, `scripts/doctor.sh` for diagnostics). The default
+> `127.0.0.1:8601` only works from the same host — for a remote server open an
+> SSH tunnel first (`ssh -N -L 8601:127.0.0.1:8601 server`) and point
+> `OCRC_SERVER` at the local end.
+
 ## Use
 
 ```sh

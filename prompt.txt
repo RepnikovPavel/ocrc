@@ -42,7 +42,11 @@ HOW TO CALL
     ocrc refuses rather than corrupt the zip with its own log lines. Use
     `--quiet` to suppress progress, or split with `> out.zip 2> log.txt`.
 
-  Server address: --server URL, or env OCRC_SERVER (default http://127.0.0.1:8601)
+  Server address: --server URL, or env OCRC_SERVER (default http://127.0.0.1:8601).
+  The default means "on the same host as the demo"; from another machine open
+  an SSH tunnel (`ssh -N -L 8601:127.0.0.1:8601 server`) and point OCRC_SERVER
+  at the local end. To run/diagnose the service itself, see the server repo's
+  AGENTS.md and `scripts/doctor.sh`.
 
 OUTPUT  (TSV, tab-separated, deterministic, easy to parse)
   parse:   file<TAB>sha256<TAB>status<TAB>pages<TAB>tokens<TAB>output<TAB>task
