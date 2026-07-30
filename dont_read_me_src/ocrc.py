@@ -792,10 +792,36 @@ def emit(header, rows):
 
 # --------------------------------------------------------------------------
 
+END2END_EXAMPLES = """\
+parse a document end-to-end (install once, then one of these per use):
+
+  # 1) one-time install (any machine with python3 >= 3.8, no dependencies):
+  curl -fsSL https://raw.githubusercontent.com/RepnikovPavel/ocrc/main/install.sh | sh
+
+  # 2) parse — point --server / OCRC_SERVER at the dots.mocr service:
+  ocrc parse paper.pdf                                   # local service (default 127.0.0.1:8601)
+  ocrc parse paper.pdf --server http://gpu-host:8601     # remote service on a trusted LAN
+  ocrc parse https://arxiv.org/pdf/XXXX.YYYYY            # URL → parse → ./ocrc-out/<sha>/document.md
+  ocrc parse paper.pdf --out report                      # → report/document.md
+  ocrc parse paper.pdf --pages 0,1,2                     # only these 0-based pages
+  ocrc queue                                             # who is waiting, in order
+
+  # from your laptop to a service bound to 127.0.0.1 on the server (no LAN expose):
+  ssh -N -L 8601:127.0.0.1:8601 server                   # one terminal, leave it open
+  ocrc parse paper.pdf                                   # OCRC_SERVER default already fits
+
+  re-submitting the same file is free: results are cached on content (SHA-256)
+  on the server, so the second call is a lookup, not a re-parse. To run the
+  service itself, see https://github.com/RepnikovPavel/ocr (scripts/bootstrap.sh).
+"""
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ocrc",
-        description="Order PDF/image parsing from a dots.mocr service. TSV on stdout.")
+        description="Order PDF/image parsing from a dots.mocr service. TSV on stdout.",
+        epilog=END2END_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--server", default=DEFAULT_SERVER,
                         help=f"service base URL (default {DEFAULT_SERVER}, env OCRC_SERVER)")
     parser.add_argument("--version", action="version", version=f"ocrc {__version__}")

@@ -10,6 +10,17 @@ WHAT IT DOES
   document is a lookup, not a second parse (measured 0.04 s vs 29 s).
   Python 3 standard library only — no pip install, no virtualenv.
 
+QUICK START (end to end)
+  # install once (python3 >= 3.8, no deps):
+  curl -fsSL https://raw.githubusercontent.com/RepnikovPavel/ocrc/main/install.sh | sh
+  # parse — point at the dots.mocr service (default http://127.0.0.1:8601):
+  ocrc parse paper.pdf                              # local service
+  ocrc parse paper.pdf --server http://gpu-host:8601  # remote service on trusted LAN
+  # to RUN the service itself (GPU box), use the server repo:
+  #   https://github.com/RepnikovPavel/ocr  →  bash scripts/bootstrap.sh
+  # it brings up vLLM + the API + the built-in parse cache, then prints this
+  # one-liner for you. No separate cache / SeaweedFS to deploy — it's built in.
+
 HOW TO CALL
   ocrc parse paper.pdf                  # parse the ENTIRE document, every page
   ocrc parse paper.pdf --out bit        # one input → bit/document.md

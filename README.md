@@ -20,9 +20,14 @@ export OCRC_SERVER=http://127.0.0.1:8601      # or pass --server
 ```
 
 > **Running the service itself?** `ocrc` only consumes a dots.mocr service; it
-> does not start one. To deploy/develop the server, see
-> [ocr/AGENTS.md](https://github.com/RepnikovPavel/ocr/blob/main/AGENTS.md)
-> (code map, env vars, `scripts/doctor.sh` for diagnostics). The default
+> does not start one. To deploy the server, clone
+> [RepnikovPavel/ocr](https://github.com/RepnikovPavel/ocr) and run
+> **`bash scripts/bootstrap.sh`** on the GPU box — one command that finds the
+> checkpoint, picks images compatible with the host's CUDA driver, brings up
+> vLLM + the API + the built-in parse cache, verifies with `doctor.sh`, and
+> prints the exact `ocrc` line for you. (Deep dive: `AGENTS.md`, `doctor.sh`.)
+> The parse cache is already built into the service (SHA-256 dedup in SQLite) —
+> **there is no separate cache / SeaweedFS to deploy.** The default
 > `127.0.0.1:8601` only works from the same host — for a remote server open an
 > SSH tunnel first (`ssh -N -L 8601:127.0.0.1:8601 server`) and point
 > `OCRC_SERVER` at the local end.
