@@ -5,6 +5,11 @@ These cover the regression that motivated the feature: arXiv URLs of the form
 service rejected them with `unsupported file type: .19348`. The fix derives
 the extension from the Content-Type header (defaulting to .pdf).
 
+They also cover GitHub support: `github.com/<owner>/<repo>/blob/<ref>/<path>`
+URLs are HTML pages, not files, so they are rewritten to the equivalent
+raw.githubusercontent.com URL before downloading; and a download that claims
+to be a PDF but lacks the %PDF- header is refused up-front.
+
 Pure-function tests only — no network, no service.
 """
 from __future__ import annotations
@@ -12,6 +17,8 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+
+import pytest
 
 # Make ocrc importable as a module without installing it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dont_read_me_src"))
@@ -102,6 +109,95 @@ def test_bogus_extension_is_replaced_not_appended():
 def test_known_ext_set_covers_pdf_and_common_images():
     for e in (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".gif", ".bmp"):
         assert e in ocrc._KNOWN_EXTS
+
+
+# ---------------------------------------------------------------------------
+# normalize_source_url — GitHub blob/raw URLs
+# ---------------------------------------------------------------------------
+
+
+def test_github_blob_url_rewritten_to_raw():
+    """A blob page is HTML; the raw host serves the file itself."""
+    assert ocrc.normalize_source_url(
+        "https://github.com/RepnikovPavel/DiplomaMasterDegree/blob/master/main.pdf"
+    ) == ("https://raw.githubusercontent.com/"
+          "RepnikovPavel/DiplomaMasterDegree/master/main.pdf")
+
+
+def test_github_raw_segment_also_rewritten():
+    assert ocrc.normalize_source_url(
+        "https://github.com/owner/repo/raw/main/docs/paper.pdf"
+    ) == "https://raw.githubusercontent.com/owner/repo/main/docs/paper.pdf"
+
+
+def test_github_branch_with_slashes_is_preserved():
+    """The ref may itself contain slashes; the raw host resolves it."""
+    assert ocrc.normalize_source_url(
+        "https://github.com/owner/repo/blob/feature/foo/doc.pdf"
+    ) == "https://raw.githubusercontent.com/owner/repo/feature/foo/doc.pdf"
+
+
+def test_raw_githubusercontent_url_passes_through():
+    url = ("https://raw.githubusercontent.com/"
+           "RepnikovPavel/DiplomaMasterDegree/master/main.pdf")
+    assert ocrc.normalize_source_url(url) == url
+
+
+def test_non_github_urls_are_untouched():
+    url = "https://arxiv.org/pdf/2606.19348"
+    assert ocrc.normalize_source_url(url) == url
+    url = "https://example.com/github.com/blob/x.pdf"
+    assert ocrc.normalize_source_url(url) == url
+
+
+def test_github_non_file_pages_are_untouched():
+    """Repo roots, issue pages etc. have no blob/raw segment to strip."""
+    url = "https://github.com/owner/repo"
+    assert ocrc.normalize_source_url(url) == url
+    url = "https://github.com/owner/repo/issues/1"
+    assert ocrc.normalize_source_url(url) == url
+
+
+# ---------------------------------------------------------------------------
+# _ensure_pdf_header — refuse HTML saved under a .pdf name
+# ---------------------------------------------------------------------------
+
+
+def test_pdf_header_check_accepts_a_real_pdf(tmp_path):
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n...")
+    ocrc._ensure_pdf_header(str(f), "https://x.com/doc.pdf")  # no raise
+
+
+def test_pdf_header_check_rejects_html(tmp_path):
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"<!DOCTYPE html><html><title>GitHub</title></html>")
+    with pytest.raises(SystemExit):
+        ocrc._ensure_pdf_header(str(f), "https://x.com/doc.pdf")
+
+
+def test_pdf_header_check_ignores_non_pdf_files(tmp_path):
+    f = tmp_path / "img.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\n")
+    ocrc._ensure_pdf_header(str(f), "https://x.com/img.png")  # no raise
+
+
+# ---------------------------------------------------------------------------
+# _github_token — env precedence
+# ---------------------------------------------------------------------------
+
+
+def test_github_token_env_precedence(monkeypatch):
+    monkeypatch.delenv("OCRC_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    assert ocrc._github_token() is None
+    monkeypatch.setenv("GH_TOKEN", "gh")
+    assert ocrc._github_token() == "gh"
+    monkeypatch.setenv("GITHUB_TOKEN", "github")
+    assert ocrc._github_token() == "github"
+    monkeypatch.setenv("OCRC_GITHUB_TOKEN", "ocrc")
+    assert ocrc._github_token() == "ocrc"
 
 
 # ---------------------------------------------------------------------------

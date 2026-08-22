@@ -50,6 +50,14 @@ HOW TO CALL
     Any arg starting with http:// or https:// is downloaded to a temp file
     first, then uploaded. The URL-decoded basename is kept as the filename
     so the server's filename column stays meaningful.
+    GitHub links work: a github.com/<owner>/<repo>/blob/<ref>/<path> URL is
+    rewritten to raw.githubusercontent.com automatically (the blob page is
+    HTML, not the file), and raw.githubusercontent.com URLs download as-is.
+    For PRIVATE repos a 404 is GitHub's anonymous answer — set
+    OCRC_GITHUB_TOKEN (or GITHUB_TOKEN / GH_TOKEN) to a token with read
+    access and it will be sent as an Authorization header to GitHub hosts.
+    A download whose name says .pdf but whose bytes lack the %PDF- header is
+    refused up-front instead of failing later on the server.
 
   OUTPUT TO STDOUT
     When stdout is piped/redirected AND there is exactly one input, the bundle

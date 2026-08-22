@@ -41,11 +41,20 @@ ocrc parse paper.pdf --out /tmp/x       # one input → /tmp/x/document.md
 ocrc parse a.pdf b.pdf --out /tmp/x     # several inputs → /tmp/x/a/..., /tmp/x/b/...
 ocrc parse paper.pdf --no-wait          # queue and return
 
+ocrc parse https://arxiv.org/pdf/2606.19348   # URL sources are fetched first
+ocrc parse https://github.com/o/r/blob/main/paper.pdf  # GitHub links too
+
 ocrc queue                              # who is waiting, in order
 ocrc watch                              # follow the queue as events arrive
 ocrc search "attention"                 # full-text over everything parsed
 ocrc stats                              # store size, cache reuse, engine state
 ```
+
+URL sources: an `http(s)://` argument is downloaded first, then uploaded.
+GitHub file links (`github.com/<owner>/<repo>/blob/<ref>/<path>`) are
+rewritten to their `raw.githubusercontent.com` equivalent — the blob page is
+HTML, not the file. For private repos set `OCRC_GITHUB_TOKEN` (or
+`GITHUB_TOKEN` / `GH_TOKEN`); without it GitHub answers 404 anonymously.
 
 **`--out` layout.** One input is unpacked straight into the directory you name
 (`ocrc parse paper.pdf --out bit` → `bit/document.md`). Several inputs get one
@@ -102,6 +111,7 @@ polling. Pass `--agent NAME` (or set `OCRC_AGENT`) so others can see who you are
 | `OCRC_PROMPT_MODE` | default prompt mode | `prompt_layout_all_en` |
 | `OCRC_AGENT` | name shown in the queue | `ocrc/$USER` |
 | `OCRC_TIMEOUT` | seconds for ordinary calls | `60` |
+| `OCRC_GITHUB_TOKEN` | token for private GitHub repos (falls back to `GITHUB_TOKEN`, `GH_TOKEN`) | unset |
 
 Uploads and downloads use a longer timeout regardless, because a large PDF
 should not fail on the same clock as a status check.

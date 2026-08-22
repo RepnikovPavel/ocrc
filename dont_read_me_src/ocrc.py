@@ -113,8 +113,66 @@ def is_url(s):
     )
 
 
+def normalize_source_url(url):
+    """Rewrite a GitHub file-page URL to its raw-download equivalent.
+
+    `https://github.com/<owner>/<repo>/blob/<ref>/<path>.pdf` is an HTML page,
+    not the file — downloading it as-is yields a webpage saved under a .pdf
+    name. The raw host serves the actual bytes, and its path layout is the
+    same minus the `blob` (or `raw`) segment, so this is a pure string
+    rewrite. Refs containing slashes keep working because
+    raw.githubusercontent.com resolves the ref itself.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.netloc.lower() in ("github.com", "www.github.com"):
+        segments = parts.path.split("/")  # ['', owner, repo, 'blob', rest...]
+        if len(segments) > 4 and segments[3] in ("blob", "raw"):
+            path = "/".join([""] + segments[1:3] + segments[4:])
+            return urllib.parse.urlunsplit(
+                ("https", "raw.githubusercontent.com", path,
+                 parts.query, parts.fragment))
+    return url
+
+
+def _github_token():
+    """Token for downloading from private GitHub repos, if the user set one."""
+    return (os.environ.get("OCRC_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN"))
+
+
+def _is_github_host(url):
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    return host in ("github.com", "www.github.com", "raw.githubusercontent.com",
+                    "media.githubusercontent.com")
+
+
+def _ensure_pdf_header(path, url):
+    """Refuse a '.pdf' download that is actually something else (HTML usually).
+
+    A URL whose basename ends in .pdf keeps that name, so a web page saved
+    under it would only fail later, on the server, with a less obvious error.
+    Real PDFs start with a %PDF- header; anything else means the URL pointed
+    at a page, not the file.
+    """
+    if Path(path).suffix.lower() != ".pdf":
+        return
+    with open(path, "rb") as handle:
+        head = handle.read(1024).lstrip()
+    if not head.startswith(b"%PDF-"):
+        snippet = head[:40].decode(errors="replace").strip()
+        raise SystemExit(
+            f"ocrc: {url} did not serve a PDF (no %PDF- header; content "
+            f"starts with {snippet!r}) — the link likely points at a web "
+            f"page, not the file itself")
+
+
 def fetch_url_to_temp(url, dest_dir):
     """Download a URL into dest_dir, returning the local path.
+
+    GitHub file-page URLs (`github.com/.../blob/...`) are rewritten to their
+    raw.githubusercontent.com equivalent first, and downloads from GitHub
+    hosts carry an Authorization header when OCRC_GITHUB_TOKEN / GITHUB_TOKEN
+    / GH_TOKEN is set (private repos 404 anonymously).
 
     Uses the URL-decoded basename as filename when it carries a usable
     extension (so the server's `filename` column stays meaningful). When the
@@ -123,6 +181,7 @@ def fetch_url_to_temp(url, dest_dir):
     header, falling back to `.pdf` since that's by far the dominant case for
     document-fetching CLI tools.
     """
+    url = normalize_source_url(url)
     parsed = urllib.parse.urlparse(url)
     name = urllib.parse.unquote(os.path.basename(parsed.path or "")) or "download"
     name = os.path.basename(name)  # sanitize to a single component
@@ -138,9 +197,24 @@ def fetch_url_to_temp(url, dest_dir):
         name = name[: -len(ext)] if ext else name
 
     dest = Path(dest_dir) / name
-    req = urllib.request.Request(url, headers={"User-Agent": f"ocrc/{__version__}"})
+    headers = {"User-Agent": f"ocrc/{__version__}"}
+    token = _github_token() if _is_github_host(url) else None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     log(f"ocrc: downloading {url}")
-    with urllib.request.urlopen(req, timeout=max(TIMEOUT, 300)) as response:
+    try:
+        response = urllib.request.urlopen(req, timeout=max(TIMEOUT, 300))
+    except urllib.error.HTTPError as error:
+        # A 404 from a GitHub host with no token configured almost always
+        # means "private repo" (GitHub 404s anonymously instead of 401).
+        if error.code == 404 and _is_github_host(url) and not _github_token():
+            raise SystemExit(
+                f"ocrc: {url} returned 404 — if the repository is private, "
+                f"set OCRC_GITHUB_TOKEN (or GITHUB_TOKEN / GH_TOKEN) to a "
+                f"GitHub token with read access")
+        raise
+    with response:
         # If we ended up without a known extension, derive one from the
         # Content-Type header; default to .pdf (the dominant case for this CLI).
         if os.path.splitext(dest.name)[1].lower() not in _KNOWN_EXTS:
@@ -153,6 +227,7 @@ def fetch_url_to_temp(url, dest_dir):
                 if not chunk:
                     break
                 out.write(chunk)
+    _ensure_pdf_header(dest, url)
     log(f"ocrc: saved {dest.stat().st_size} bytes → {dest.name}")
     return str(dest)
 
@@ -829,7 +904,9 @@ def build_parser():
 
     parse = sub.add_parser("parse", help="parse documents and download the result")
     parse.add_argument("paths", nargs="+",
-                       help="PDF or image files, or http(s):// URLs to fetch first")
+                       help="PDF or image files, or http(s):// URLs to fetch first "
+                            "(github.com/.../blob/... links are rewritten to the "
+                            "raw file; set OCRC_GITHUB_TOKEN for private repos)")
     parse.add_argument("--prompt-mode", default=DEFAULT_MODE, dest="prompt_mode")
     parse.add_argument("--pages", default=None,
                        help="0-based page selection, e.g. 0,1,2. "
