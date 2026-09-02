@@ -325,7 +325,9 @@ def wait_for(server, sha256, mode, poll=3.0, quiet=False,
         if state.get("cached") or state.get("status") == "done":
             return state
         if state.get("status") in {"error", "cancelled"}:
-            raise SystemExit(f"ocrc: parsing {state['status']} for {sha256[:12]}")
+            detail = state.get("error") or ""
+            suffix = f": {detail}" if detail else ""
+            raise SystemExit(f"ocrc: parsing {state['status']} for {sha256[:12]}{suffix}")
         progress = state.get("progress") or {}
         line = f"{progress.get('done', 0)}/{progress.get('total', '?')}"
         if not quiet and line != last:
