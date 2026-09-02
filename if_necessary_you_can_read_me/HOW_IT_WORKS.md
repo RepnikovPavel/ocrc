@@ -64,4 +64,7 @@ removes the class of bug entirely.
 
 `0` success · `2` usage error · non-zero with a message on stderr otherwise.
 Server errors carry the server's own message, not just a status code — a bare
-"400 Bad Request" is not something an agent can act on.
+"400 Bad Request" is not something an agent can act on. The same holds for a
+failed parse: when the service reports `status=error`, the exit message
+includes the server's `error` field (the actual exception), so the failure is
+diagnosable without server access.
